@@ -69,9 +69,12 @@ type Sqlmock interface {
 	// to parallelize your query executation, that option may
 	// be handy.
 	MatchExpectationsInOrder(bool)
+
+	RequireExpectations(bool)
 }
 
 type sqlmock struct {
+	requireExpectations bool
 	ordered bool
 	dsn     string
 	opened  int
@@ -98,11 +101,15 @@ func (c *sqlmock) MatchExpectationsInOrder(b bool) {
 	c.ordered = b
 }
 
+func (c *sqlmock) RequireExpectations(required bool) {
+	c.requireExpectations = required
+}
+
 // Close a mock database driver connection. It may or may not
 // be called depending on the sircumstances, but if it is called
 // there must be an *ExpectedClose expectation satisfied.
 // meets http://golang.org/pkg/database/sql/driver/#Conn interface
-func (c *sqlmock) Close() error {
+func (c *sqlmock) Close() (err error) {
 	c.drv.Lock()
 	defer c.drv.Unlock()
 
@@ -133,16 +140,20 @@ func (c *sqlmock) Close() error {
 	}
 
 	if expected == nil {
-		msg := "call to database Close was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
+		if c.requireExpectations {
+			msg := "call to database Close was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
+			}
+			return fmt.Errorf(msg)
 		}
-		return fmt.Errorf(msg)
+	} else {
+		err = expected.err
+		expected.triggered = true
+		expected.Unlock()
 	}
 
-	expected.triggered = true
-	expected.Unlock()
-	return expected.err
+	return err
 }
 
 func (c *sqlmock) ExpectationsWereMet() error {
@@ -155,7 +166,7 @@ func (c *sqlmock) ExpectationsWereMet() error {
 }
 
 // Begin meets http://golang.org/pkg/database/sql/driver/#Conn interface
-func (c *sqlmock) Begin() (driver.Tx, error) {
+func (c *sqlmock) Begin() (res driver.Tx, err error) {
 	var expected *ExpectedBegin
 	var ok bool
 	var fulfilled int
@@ -176,17 +187,22 @@ func (c *sqlmock) Begin() (driver.Tx, error) {
 			return nil, fmt.Errorf("call to database transaction Begin, was not expected, next expectation is: %s", next)
 		}
 	}
+
 	if expected == nil {
-		msg := "call to database transaction Begin was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
+		if c.requireExpectations {
+			msg := "call to database transaction Begin was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
+			}
+			return nil, fmt.Errorf(msg)
 		}
-		return nil, fmt.Errorf(msg)
+	} else {
+		err = expected.err
+		expected.triggered = true
+		expected.Unlock()
 	}
 
-	expected.triggered = true
-	expected.Unlock()
-	return c, expected.err
+	return c, err
 }
 
 func (c *sqlmock) ExpectBegin() *ExpectedBegin {
@@ -224,44 +240,50 @@ func (c *sqlmock) Exec(query string, args []driver.Value) (res driver.Result, er
 		}
 		next.Unlock()
 	}
+
 	if expected == nil {
-		msg := "call to exec '%s' query with args %+v was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
-		}
-		return nil, fmt.Errorf(msg, query, args)
-	}
-
-	defer expected.Unlock()
-	expected.triggered = true
-	// converts panic to error in case of reflect value type mismatch
-	defer func(errp *error, exp *ExpectedExec, q string, a []driver.Value) {
-		if e := recover(); e != nil {
-			if se, ok := e.(*reflect.ValueError); ok { // catch reflect error, failed type conversion
-				msg := "exec query \"%s\", args \"%+v\" failed to match with error \"%s\" expectation: %s"
-				*errp = fmt.Errorf(msg, q, a, se, exp)
-			} else {
-				panic(e) // overwise if unknown error panic
+		if c.requireExpectations {
+			msg := "call to exec '%s' query with args %+v was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
 			}
+			return nil, fmt.Errorf(msg, query, args)
 		}
-	}(&err, expected, query, args)
+	} else {
+		defer expected.Unlock()
+		expected.triggered = true
+		// converts panic to error in case of reflect value type mismatch
+		defer func(errp *error, exp *ExpectedExec, q string, a []driver.Value) {
+			if e := recover(); e != nil {
+				if se, ok := e.(*reflect.ValueError); ok { // catch reflect error, failed type conversion
+					msg := "exec query \"%s\", args \"%+v\" failed to match with error \"%s\" expectation: %s"
+					*errp = fmt.Errorf(msg, q, a, se, exp)
+				} else {
+					panic(e) // overwise if unknown error panic
+				}
+			}
+		}(&err, expected, query, args)
 
-	if !expected.queryMatches(query) {
-		return nil, fmt.Errorf("exec query '%s', does not match regex '%s'", query, expected.sqlRegex.String())
+		if !expected.queryMatches(query) {
+			return nil, fmt.Errorf("exec query '%s', does not match regex '%s'", query, expected.sqlRegex.String())
+		}
+
+		if !expected.argsMatches(args) {
+			return nil, fmt.Errorf("exec query '%s', args %+v does not match expected %+v", query, args, expected.args)
+		}
+
+		if expected.err != nil {
+			return nil, expected.err // mocked to return error
+		}
+
+		if expected.result == nil {
+			return nil, fmt.Errorf("exec query '%s' with args %+v, must return a database/sql/driver.result, but it was not set for expectation %T as %+v", query, args, expected, expected)
+		}
+
+		res = expected.result
 	}
 
-	if !expected.argsMatches(args) {
-		return nil, fmt.Errorf("exec query '%s', args %+v does not match expected %+v", query, args, expected.args)
-	}
-
-	if expected.err != nil {
-		return nil, expected.err // mocked to return error
-	}
-
-	if expected.result == nil {
-		return nil, fmt.Errorf("exec query '%s' with args %+v, must return a database/sql/driver.result, but it was not set for expectation %T as %+v", query, args, expected, expected)
-	}
-	return expected.result, err
+	return res, err
 }
 
 func (c *sqlmock) ExpectExec(sqlRegexStr string) *ExpectedExec {
@@ -272,7 +294,7 @@ func (c *sqlmock) ExpectExec(sqlRegexStr string) *ExpectedExec {
 }
 
 // Prepare meets http://golang.org/pkg/database/sql/driver/#Conn interface
-func (c *sqlmock) Prepare(query string) (driver.Stmt, error) {
+func (c *sqlmock) Prepare(query string) (res driver.Stmt, err error) {
 	var expected *ExpectedPrepare
 	var fulfilled int
 	var ok bool
@@ -296,16 +318,20 @@ func (c *sqlmock) Prepare(query string) (driver.Stmt, error) {
 
 	query = stripQuery(query)
 	if expected == nil {
-		msg := "call to Prepare '%s' query was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
+		if c.requireExpectations {
+			msg := "call to Prepare '%s' query was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
+			}
+			return nil, fmt.Errorf(msg, query)
 		}
-		return nil, fmt.Errorf(msg, query)
+	} else {
+		expected.triggered = true
+		expected.Unlock()
+		res, err = &statement{c, query, expected.closeErr}, expected.err
 	}
 
-	expected.triggered = true
-	expected.Unlock()
-	return &statement{c, query, expected.closeErr}, expected.err
+	return res, err
 }
 
 func (c *sqlmock) ExpectPrepare(sqlRegexStr string) *ExpectedPrepare {
@@ -345,44 +371,48 @@ func (c *sqlmock) Query(query string, args []driver.Value) (rw driver.Rows, err 
 	}
 
 	if expected == nil {
-		msg := "call to query '%s' with args %+v was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
-		}
-		return nil, fmt.Errorf(msg, query, args)
-	}
-
-	defer expected.Unlock()
-	expected.triggered = true
-	// converts panic to error in case of reflect value type mismatch
-	defer func(errp *error, exp *ExpectedQuery, q string, a []driver.Value) {
-		if e := recover(); e != nil {
-			if se, ok := e.(*reflect.ValueError); ok { // catch reflect error, failed type conversion
-				msg := "query \"%s\", args \"%+v\" failed to match with error \"%s\" expectation: %s"
-				*errp = fmt.Errorf(msg, q, a, se, exp)
-			} else {
-				panic(e) // overwise if unknown error panic
+		if c.requireExpectations {
+			msg := "call to query '%s' with args %+v was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
 			}
+			return nil, fmt.Errorf(msg, query, args)
 		}
-	}(&err, expected, query, args)
+	} else {
+		defer expected.Unlock()
+		expected.triggered = true
+		// converts panic to error in case of reflect value type mismatch
+		defer func(errp *error, exp *ExpectedQuery, q string, a []driver.Value) {
+			if e := recover(); e != nil {
+				if se, ok := e.(*reflect.ValueError); ok { // catch reflect error, failed type conversion
+					msg := "query \"%s\", args \"%+v\" failed to match with error \"%s\" expectation: %s"
+					*errp = fmt.Errorf(msg, q, a, se, exp)
+				} else {
+					panic(e) // overwise if unknown error panic
+				}
+			}
+		}(&err, expected, query, args)
 
-	if !expected.queryMatches(query) {
-		return nil, fmt.Errorf("query '%s', does not match regex [%s]", query, expected.sqlRegex.String())
+		if !expected.queryMatches(query) {
+			return nil, fmt.Errorf("query '%s', does not match regex [%s]", query, expected.sqlRegex.String())
+		}
+
+		if !expected.argsMatches(args) {
+			return nil, fmt.Errorf("query '%s', args %+v does not match expected %+v", query, args, expected.args)
+		}
+
+		if expected.err != nil {
+			return nil, expected.err // mocked to return error
+		}
+
+		if expected.rows == nil {
+			return nil, fmt.Errorf("query '%s' with args %+v, must return a database/sql/driver.rows, but it was not set for expectation %T as %+v", query, args, expected, expected)
+		}
+
+		rw = expected.rows
 	}
 
-	if !expected.argsMatches(args) {
-		return nil, fmt.Errorf("query '%s', args %+v does not match expected %+v", query, args, expected.args)
-	}
-
-	if expected.err != nil {
-		return nil, expected.err // mocked to return error
-	}
-
-	if expected.rows == nil {
-		return nil, fmt.Errorf("query '%s' with args %+v, must return a database/sql/driver.rows, but it was not set for expectation %T as %+v", query, args, expected, expected)
-	}
-
-	return expected.rows, err
+	return rw, err
 }
 
 func (c *sqlmock) ExpectQuery(sqlRegexStr string) *ExpectedQuery {
@@ -405,7 +435,7 @@ func (c *sqlmock) ExpectRollback() *ExpectedRollback {
 }
 
 // Commit meets http://golang.org/pkg/database/sql/driver/#Tx
-func (c *sqlmock) Commit() error {
+func (c *sqlmock) Commit() (err error) {
 	var expected *ExpectedCommit
 	var fulfilled int
 	var ok bool
@@ -426,21 +456,26 @@ func (c *sqlmock) Commit() error {
 			return fmt.Errorf("call to commit transaction, was not expected, next expectation is: %s", next)
 		}
 	}
+
 	if expected == nil {
-		msg := "call to commit transaction was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
+		if c.requireExpectations {
+			msg := "call to commit transaction was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
+			}
+			return fmt.Errorf(msg)
 		}
-		return fmt.Errorf(msg)
+	} else {
+		expected.triggered = true
+		expected.Unlock()
+		err = expected.err
 	}
 
-	expected.triggered = true
-	expected.Unlock()
-	return expected.err
+	return err
 }
 
 // Rollback meets http://golang.org/pkg/database/sql/driver/#Tx
-func (c *sqlmock) Rollback() error {
+func (c *sqlmock) Rollback() (err error) {
 	var expected *ExpectedRollback
 	var fulfilled int
 	var ok bool
@@ -461,15 +496,20 @@ func (c *sqlmock) Rollback() error {
 			return fmt.Errorf("call to rollback transaction, was not expected, next expectation is: %s", next)
 		}
 	}
+
 	if expected == nil {
-		msg := "call to rollback transaction was not expected"
-		if fulfilled == len(c.expected) {
-			msg = "all expectations were already fulfilled, " + msg
+		if c.requireExpectations {
+			msg := "call to rollback transaction was not expected"
+			if fulfilled == len(c.expected) {
+				msg = "all expectations were already fulfilled, " + msg
+			}
+			return fmt.Errorf(msg)
 		}
-		return fmt.Errorf(msg)
+	} else {
+		expected.triggered = true
+		expected.Unlock()
+		err = expected.err
 	}
 
-	expected.triggered = true
-	expected.Unlock()
-	return expected.err
+	return err
 }

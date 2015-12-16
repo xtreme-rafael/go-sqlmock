@@ -44,7 +44,7 @@ func New() (*sql.DB, Sqlmock, error) {
 	dsn := fmt.Sprintf("sqlmock_db_%d", pool.counter)
 	pool.counter++
 
-	smock := &sqlmock{dsn: dsn, drv: pool, ordered: true}
+	smock := &sqlmock{dsn: dsn, drv: pool, ordered: false, requireExpectations: false}
 	pool.conns[dsn] = smock
 	pool.Unlock()
 
@@ -70,7 +70,7 @@ func NewWithDSN(dsn string) (*sql.DB, Sqlmock, error) {
 		pool.Unlock()
 		return nil, nil, fmt.Errorf("cannot create a new mock database with the same dsn: %s", dsn)
 	}
-	smock := &sqlmock{dsn: dsn, drv: pool, ordered: true}
+	smock := &sqlmock{dsn: dsn, drv: pool, ordered: false, requireExpectations: false}
 	pool.conns[dsn] = smock
 	pool.Unlock()
 
