@@ -7,7 +7,14 @@ import (
 	"sync"
 )
 
+const (
+	DefaultMatchExpectationsInOrder = false
+	DefaultRequireExpectations = false
+)
+
 var pool *mockDriver
+var defaultOrdered = DefaultMatchExpectationsInOrder
+var defaultRequire = DefaultRequireExpectations
 
 func init() {
 	pool = &mockDriver{
@@ -35,6 +42,14 @@ func (d *mockDriver) Open(dsn string) (driver.Conn, error) {
 	return c, nil
 }
 
+func SetDefaultMatchExpectationsInOrder(ordered bool) {
+	defaultOrdered = ordered
+}
+
+func SetDefaultRequireExpectations(required bool) {
+	defaultRequire = required
+}
+
 // New creates sqlmock database connection
 // and a mock to manage expectations.
 // Pings db so that all expectations could be
@@ -44,7 +59,7 @@ func New() (*sql.DB, Sqlmock, error) {
 	dsn := fmt.Sprintf("sqlmock_db_%d", pool.counter)
 	pool.counter++
 
-	smock := &sqlmock{dsn: dsn, drv: pool, ordered: false, requireExpectations: false}
+	smock := &sqlmock{dsn: dsn, drv: pool, ordered: defaultOrdered, requireExpectations: defaultRequire}
 	pool.conns[dsn] = smock
 	pool.Unlock()
 
@@ -70,7 +85,7 @@ func NewWithDSN(dsn string) (*sql.DB, Sqlmock, error) {
 		pool.Unlock()
 		return nil, nil, fmt.Errorf("cannot create a new mock database with the same dsn: %s", dsn)
 	}
-	smock := &sqlmock{dsn: dsn, drv: pool, ordered: false, requireExpectations: false}
+	smock := &sqlmock{dsn: dsn, drv: pool, ordered: defaultOrdered, requireExpectations: defaultRequire}
 	pool.conns[dsn] = smock
 	pool.Unlock()
 
